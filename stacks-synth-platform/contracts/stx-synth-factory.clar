@@ -20,6 +20,9 @@
 (define-constant ERR-NOT-AUTHORIZED-ORACLE (err u113))
 (define-constant ERR-PROTOCOL-PAUSED (err u114))
 (define-constant ERR-WITHIN-COOLDOWN-PERIOD (err u115))
+(define-constant ERR-INVALID-PRINCIPAL (err u116))
+(define-constant ERR-INVALID-PARAMETER (err u117))
+(define-constant ERR-INVALID-ASSET-SYMBOL (err u118))
 
 ;; Protocol safety parameters
 (define-constant minimum-collateral-ratio u150) ;; 150% minimum collateralization
@@ -92,11 +95,23 @@
   }
 )
 
+;; Validation functions
+(define-read-only (is-valid-principal (address principal))
+  (not (is-eq address contract-admin))
+)
+
+(define-read-only (is-valid-asset-symbol (asset-symbol (string-ascii 10)))
+  (is-some (map-get? registered-synthetic-assets { asset-symbol: asset-symbol }))
+)
+
 ;; GOVERNANCE FUNCTIONS
 ;; Register a new governance member
 (define-public (add-dao-member (member principal))
   (begin
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
+    ;; Validate member principal
+    (asserts! (is-valid-principal member) ERR-INVALID-PRINCIPAL)
+    
     (map-set dao-members
       { member-address: member }
       { can-modify-parameters: true }
@@ -109,6 +124,9 @@
 (define-public (remove-dao-member (member principal))
   (begin
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
+    ;; Validate member principal
+    (asserts! (is-valid-principal member) ERR-INVALID-PRINCIPAL)
+    
     (map-delete dao-members { member-address: member })
     (ok true)
   )
@@ -118,6 +136,9 @@
 (define-public (register-price-provider (provider principal))
   (begin
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
+    ;; Validate provider principal
+    (asserts! (is-valid-principal provider) ERR-INVALID-PRINCIPAL)
+    
     (map-set authorized-data-providers
       { provider-address: provider }
       { can-update-price-feeds: true }
@@ -130,6 +151,9 @@
 (define-public (deactivate-price-provider (provider principal))
   (begin
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
+    ;; Validate provider principal
+    (asserts! (is-valid-principal provider) ERR-INVALID-PRINCIPAL)
+    
     (map-delete authorized-data-providers { provider-address: provider })
     (ok true)
   )
@@ -166,6 +190,10 @@
 (define-public (update-timelock-duration (new-timelock-blocks uint))
   (begin
     (asserts! (has-governance-authority) ERR-NOT-GOVERNANCE-MEMBER)
+    ;; Validate timelock parameter
+    (asserts! (> new-timelock-blocks u0) ERR-INVALID-PARAMETER)
+    (asserts! (< new-timelock-blocks u1000) ERR-INVALID-PARAMETER)
+    
     (var-set withdrawal-timelock-blocks new-timelock-blocks)
     (ok true)
   )
@@ -179,6 +207,8 @@
     )
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
     (asserts! (> treasury-amount u0) ERR-COLLATERAL-BELOW-THRESHOLD)
+    ;; Validate recipient principal
+    (asserts! (is-valid-principal recipient) ERR-INVALID-PRINCIPAL)
     
     ;; Reset accumulated revenue
     (var-set treasury-balance-accumulated u0)
@@ -195,6 +225,10 @@
 (define-public (register-new-asset (asset-symbol (string-ascii 10)) (decimal-precision uint))
   (begin
     (asserts! (is-eq tx-sender contract-admin) ERR-ADMIN-ONLY)
+    ;; Validate asset symbol and decimal precision
+    (asserts! (not (is-valid-asset-symbol asset-symbol)) ERR-ASSET-NOT-SUPPORTED) ;; Asset shouldn't already exist
+    (asserts! (and (>= decimal-precision u1) (<= decimal-precision u18)) ERR-INVALID-PARAMETER)
+    
     (map-set registered-synthetic-assets
       { asset-symbol: asset-symbol }
       {
@@ -225,6 +259,8 @@
     ;; Verify oracle authorization
     (asserts! (has-oracle-authority) ERR-NOT-AUTHORIZED-ORACLE)
     (asserts! (is-eq (get is-active-for-trading asset-data) true) ERR-ASSET-NOT-SUPPORTED)
+    ;; Validate price
+    (asserts! (> new-price u0) ERR-INVALID-PARAMETER)
     
     ;; Record updated price information
     (map-set asset-market-prices
@@ -256,64 +292,77 @@
       (asset-data (unwrap! (get-registered-asset-info asset-symbol) ERR-ASSET-NOT-SUPPORTED))
       (price-info (unwrap! (get-verified-price asset-symbol) ERR-ASSET-NOT-SUPPORTED))
       (market-price (get current-price price-info))
-      (protocol-fee (compute-fee-amount collateral-amount (var-get synthetic-creation-fee)))
-      (effective-collateral (- collateral-amount protocol-fee))
-      (collateral-value (* effective-collateral u100000000))
-      (synthetic-value (* synthetic-amount market-price))
-      (health-ratio (/ (* collateral-value u100) synthetic-value))
-      (position-key { user-address: tx-sender, asset-symbol: asset-symbol })
-      (metrics-key { asset-symbol: asset-symbol })
-      (global-metrics (default-to { total-collateral-locked: u0, total-synthetic-issued: u0 } 
-                     (map-get? global-asset-metrics metrics-key)))
-      (existing-position (map-get? user-synthetic-positions position-key))
     )
     ;; Protocol safety checks
     (asserts! (not (var-get system-emergency-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (>= synthetic-amount minimum-mint-value) ERR-MINT-AMOUNT-TOO-SMALL)
     (asserts! (<= synthetic-amount maximum-mint-value) ERR-MINT-AMOUNT-TOO-LARGE)
-    (asserts! (>= health-ratio minimum-collateral-ratio) ERR-COLLATERAL-BELOW-THRESHOLD)
     (asserts! (is-eq (get is-active-for-trading asset-data) true) ERR-ASSET-NOT-SUPPORTED)
+    (asserts! (> collateral-amount u0) ERR-COLLATERAL-BELOW-THRESHOLD)
     
-    ;; Transfer collateral to contract
-    (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
-    
-    ;; Record protocol revenue
-    (var-set treasury-balance-accumulated (+ (var-get treasury-balance-accumulated) protocol-fee))
-    
-    ;; Process position creation or update
-    (match existing-position
-      existing-pos ;; Add to existing position
-      (map-set user-synthetic-positions
-        position-key
+    (let
+      (
+        (protocol-fee (compute-fee-amount collateral-amount (var-get synthetic-creation-fee)))
+        (effective-collateral (- collateral-amount protocol-fee))
+        (collateral-value (* effective-collateral u100000000))
+        (synthetic-value (* synthetic-amount market-price))
+        (health-ratio (/ (* collateral-value u100) synthetic-value))
+        (position-key { user-address: tx-sender, asset-symbol: asset-symbol })
+        (metrics-key { asset-symbol: asset-symbol })
+        (global-metrics (default-to { total-collateral-locked: u0, total-synthetic-issued: u0 } 
+                       (map-get? global-asset-metrics metrics-key)))
+        (existing-position (map-get? user-synthetic-positions position-key))
+      )
+      ;; Additional safety check
+      (asserts! (>= health-ratio minimum-collateral-ratio) ERR-COLLATERAL-BELOW-THRESHOLD)
+      
+      ;; Transfer collateral to contract
+      (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+      
+      ;; Record protocol revenue - safe because protocol-fee is derived from validated collateral-amount
+      (var-set treasury-balance-accumulated (+ (var-get treasury-balance-accumulated) protocol-fee))
+      
+      ;; Process position creation or update
+      (match existing-position
+        existing-pos ;; Add to existing position
+        (let
+          (
+            (new-collateral (+ (get collateral-amount-locked existing-pos) effective-collateral))
+            (new-synthetic (+ (get synthetic-tokens-issued existing-pos) synthetic-amount))
+          )
+          (map-set user-synthetic-positions
+            position-key
+            {
+              collateral-amount-locked: new-collateral,
+              synthetic-tokens-issued: new-synthetic,
+              position-open-block: (get position-open-block existing-pos),
+              last-activity-block: block-height
+            }
+          )
+        )
+        ;; Create new position record
+        (map-set user-synthetic-positions
+          position-key
+          {
+            collateral-amount-locked: effective-collateral,
+            synthetic-tokens-issued: synthetic-amount,
+            position-open-block: block-height,
+            last-activity-block: block-height
+          }
+        )
+      )
+      
+      ;; Update global statistics - safe because effective-collateral is derived from validated collateral-amount
+      (map-set global-asset-metrics
+        metrics-key
         {
-          collateral-amount-locked: (+ (get collateral-amount-locked existing-pos) effective-collateral),
-          synthetic-tokens-issued: (+ (get synthetic-tokens-issued existing-pos) synthetic-amount),
-          position-open-block: (get position-open-block existing-pos),
-          last-activity-block: block-height
+          total-collateral-locked: (+ (get total-collateral-locked global-metrics) effective-collateral),
+          total-synthetic-issued: (+ (get total-synthetic-issued global-metrics) synthetic-amount)
         }
       )
-      ;; Create new position record
-      (map-set user-synthetic-positions
-        position-key
-        {
-          collateral-amount-locked: effective-collateral,
-          synthetic-tokens-issued: synthetic-amount,
-          position-open-block: block-height,
-          last-activity-block: block-height
-        }
-      )
+      
+      (ok synthetic-amount)
     )
-    
-    ;; Update global statistics
-    (map-set global-asset-metrics
-      metrics-key
-      {
-        total-collateral-locked: (+ (get total-collateral-locked global-metrics) effective-collateral),
-        total-synthetic-issued: (+ (get total-synthetic-issued global-metrics) synthetic-amount)
-      }
-    )
-    
-    (ok synthetic-amount)
   )
 )
 
@@ -326,35 +375,40 @@
       (metrics-key { asset-symbol: asset-symbol })
       (global-metrics (default-to { total-collateral-locked: u0, total-synthetic-issued: u0 }
                       (map-get? global-asset-metrics metrics-key)))
-      (updated-collateral (+ (get collateral-amount-locked current-position) additional-amount))
     )
-    ;; Check protocol status
+    ;; Check protocol status and validate input
     (asserts! (not (var-get system-emergency-paused)) ERR-PROTOCOL-PAUSED)
+    (asserts! (> additional-amount u0) ERR-INVALID-PARAMETER)
     
-    ;; Transfer additional collateral
-    (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
-    
-    ;; Update position data
-    (map-set user-synthetic-positions
-      position-key
-      {
-        collateral-amount-locked: updated-collateral,
-        synthetic-tokens-issued: (get synthetic-tokens-issued current-position),
-        position-open-block: (get position-open-block current-position),
-        last-activity-block: block-height
-      }
+    (let
+      (
+        (updated-collateral (+ (get collateral-amount-locked current-position) additional-amount))
+      )
+      ;; Transfer additional collateral
+      (try! (stx-transfer? additional-amount tx-sender (as-contract tx-sender)))
+      
+      ;; Update position data - safe because updated-collateral is derived from validated additional-amount
+      (map-set user-synthetic-positions
+        position-key
+        {
+          collateral-amount-locked: updated-collateral,
+          synthetic-tokens-issued: (get synthetic-tokens-issued current-position),
+          position-open-block: (get position-open-block current-position),
+          last-activity-block: block-height
+        }
+      )
+      
+      ;; Update protocol statistics - safe because additional-amount is validated
+      (map-set global-asset-metrics
+        metrics-key
+        {
+          total-collateral-locked: (+ (get total-collateral-locked global-metrics) additional-amount),
+          total-synthetic-issued: (get total-synthetic-issued global-metrics)
+        }
+      )
+      
+      (ok updated-collateral)
     )
-    
-    ;; Update protocol statistics
-    (map-set global-asset-metrics
-      metrics-key
-      {
-        total-collateral-locked: (+ (get total-collateral-locked global-metrics) additional-amount),
-        total-synthetic-issued: (get total-synthetic-issued global-metrics)
-      }
-    )
-    
-    (ok updated-collateral)
   )
 )
 
@@ -376,6 +430,7 @@
     (asserts! (not (var-get system-emergency-paused)) ERR-PROTOCOL-PAUSED)
     (asserts! (>= blocks-since-update (var-get withdrawal-timelock-blocks)) ERR-WITHIN-COOLDOWN-PERIOD)
     (asserts! (<= synthetic-amount position-total-synthetic) ERR-COLLATERAL-BELOW-THRESHOLD)
+    (asserts! (> synthetic-amount u0) ERR-INVALID-PARAMETER)
     
     ;; Calculate proportional collateral for redemption
     (let
